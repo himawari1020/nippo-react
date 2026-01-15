@@ -11,15 +11,19 @@ export const useAuth = () => {
   const [inviteCode, setInviteCode] = useState<string>("");
   const [loading, setLoading] = useState(true);
   
-  // 状態フラグ
   const [isWaitingVerification, setIsWaitingVerification] = useState(false);
   const [isNewUser, setIsNewUser] = useState(false);
 
-  // 自動ログアウト用タイマー
+  // 「一度でもデータ取得に成功したか」を記録するフラグ（リアルタイム削除検知用）
+  const userExistsRef = useRef(false);
   const timeoutIdRef = useRef<number | null>(null);
 
-  // 状態リセット
-  const resetState = () => {
+  // ログアウト処理（共通化）
+  const performLogout = async () => {
+    if (timeoutIdRef.current) {
+      window.clearTimeout(timeoutIdRef.current);
+    }
+    await signOut(auth);
     setUser(null);
     setCompanyId(null);
     setRole(null);
@@ -27,13 +31,13 @@ export const useAuth = () => {
     setInviteCode("");
     setIsWaitingVerification(false);
     setIsNewUser(false);
+    userExistsRef.current = false;
   };
 
   useEffect(() => {
     let unsubscribeFirestore: (() => void) | null = null;
 
     const unsubscribeAuth = onAuthStateChanged(auth, async (currentUser) => {
-      // 以前のFirestore監視を解除
       if (unsubscribeFirestore) {
         unsubscribeFirestore();
         unsubscribeFirestore = null;
@@ -48,10 +52,11 @@ export const useAuth = () => {
           setIsWaitingVerification(false);
           setUser(currentUser);
           
-          // ユーザー情報をリアルタイム監視
           unsubscribeFirestore = onSnapshot(doc(db, "users", currentUser.uid), async (userDoc) => {
+            // ■ ケース1: データが正常に取得できた場合
             if (userDoc.exists()) {
-              // --- データが存在する場合（通常） ---
+              userExistsRef.current = true; // 「存在した」という履歴を残す
+
               const userData = userDoc.data();
               const cid = userData?.companyId ?? null;
               
@@ -75,53 +80,66 @@ export const useAuth = () => {
                 setUserCompanyName("");
               }
             } else {
-              // --- Firestoreにデータがない場合 ---
+              // ■ ケース2: データが存在しない場合 (!exists)
+              
+              // 2-A: さっきまで見ていたのに消えた（＝リアルタイム削除）
+              if (userExistsRef.current) {
+                console.warn("データ消失検知: ログアウトします");
+                performLogout();
+                return;
+              }
+
+              // 2-B: リロード時など最初からデータがない場合
               try {
-                // 【修正点】reload() ではなく getIdToken(true) を使用
-                // 強制的にトークンリフレッシュを行うことで、削除済みユーザー（リフレッシュトークン無効）を確実に検知してエラーを発生させます。
+                // 生存確認: 強制トークンリフレッシュ
                 await currentUser.getIdToken(true);
                 
-                // エラーが出なければアカウントは有効（＝本当の新規登録中のユーザー）
+                // 【追加対策】作成から5分以上経過しているのにデータがない＝削除済みユーザーの残留とみなす
+                const creationTime = new Date(currentUser.metadata.creationTime || 0).getTime();
+                const now = Date.now();
+                const isOldAccount = (now - creationTime) > 5 * 60 * 1000; // 5分
+
+                if (isOldAccount) {
+                   console.warn("古いアカウントのデータ未存在: 削除済みと判定してログアウト");
+                   performLogout();
+                   return;
+                }
+
+                // ここまで来てようやく「正真正銘の新規ユーザー」と認める
                 setIsNewUser(true);
                 setCompanyId(null);
                 setRole(null);
               } catch (error) {
-                // トークンリフレッシュ失敗 ＝ 削除済みユーザー
-                console.warn("ユーザーが無効なためログアウトします", error);
-                await signOut(auth);
-                resetState();
+                console.warn("認証無効: ログアウトします", error);
+                performLogout();
                 return;
               }
             }
             setLoading(false);
           }, (error) => {
-            console.error("ユーザーデータ監視エラー:", error);
-            setLoading(false);
+            // ■ ケース3: 権限エラー (permission-denied)
+            // ドキュメント削除により「本人条件」などのルールに違反してアクセス不可になった場合ここに来る
+            console.error("Firestore監視エラー:", error);
+            if (error.code === 'permission-denied') {
+              console.warn("権限喪失（削除の可能性大）: ログアウトします");
+              performLogout();
+            } else {
+              setLoading(false);
+            }
           });
         }
       } else {
         // ログアウト時
-        resetState();
+        setUser(null);
         setLoading(false);
       }
     });
 
     return () => {
       unsubscribeAuth();
-      if (unsubscribeFirestore) {
-        unsubscribeFirestore();
-      }
+      if (unsubscribeFirestore) unsubscribeFirestore();
     };
   }, []);
-
-  // ログアウト処理
-  const logout = async () => {
-    if (timeoutIdRef.current) {
-      window.clearTimeout(timeoutIdRef.current);
-    }
-    await signOut(auth);
-    resetState();
-  };
 
   // 無操作タイムアウト（10分）
   useEffect(() => {
@@ -130,7 +148,7 @@ export const useAuth = () => {
     const timeoutDuration = 600000; 
     const handleTimeout = () => {
       alert("一定時間操作がなかったため、自動的にログアウトしました。");
-      logout();
+      performLogout();
     };
 
     const resetTimer = () => {
@@ -162,6 +180,6 @@ export const useAuth = () => {
     loading, 
     isWaitingVerification, 
     isNewUser, 
-    logout 
+    logout: performLogout 
   };
 };
