@@ -24,5 +24,4 @@ jobs:
         with:
           args: deploy --only hosting,functions
         env:
-          # 先ほど生成されたSecret名をここに指定します
           GCP_SA_KEY: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_TEST_5070E }}
