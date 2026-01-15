@@ -18,20 +18,30 @@ export const useAuth = () => {
   // 自動ログアウト用タイマー
   const timeoutIdRef = useRef<number | null>(null);
 
+  // 状態リセット関数（useEffect内で使うため先に定義するか、useEffect内にロジックを書く）
+  // ここではset関数のみ使用するためuseEffectから参照しても安全ですが、
+  // 依存関係をシンプルにするため、ログアウト処理を共通化します。
+  const resetState = () => {
+    setUser(null);
+    setCompanyId(null);
+    setRole(null);
+    setUserCompanyName("");
+    setInviteCode("");
+    setIsWaitingVerification(false);
+    setIsNewUser(false);
+  };
+
   useEffect(() => {
-    // Firestoreの監視解除関数を保持する変数
     let unsubscribeFirestore: (() => void) | null = null;
 
-    // 認証状態の監視を開始
     const unsubscribeAuth = onAuthStateChanged(auth, async (currentUser) => {
-      // ユーザー切り替え時などに前のリスナーがあれば解除
+      // 以前のFirestore監視を解除
       if (unsubscribeFirestore) {
         unsubscribeFirestore();
         unsubscribeFirestore = null;
       }
 
       if (currentUser) {
-        // メール認証待ちのチェック
         if (!currentUser.emailVerified && currentUser.providerData[0]?.providerId === 'password') {
           setIsWaitingVerification(true);
           setUser(currentUser);
@@ -40,24 +50,22 @@ export const useAuth = () => {
           setIsWaitingVerification(false);
           setUser(currentUser);
           
-          // 【修正】getDocではなくonSnapshotでユーザー情報をリアルタイム監視
+          // ユーザー情報をリアルタイム監視
           unsubscribeFirestore = onSnapshot(doc(db, "users", currentUser.uid), async (userDoc) => {
             if (userDoc.exists()) {
+              // --- データが存在する場合（通常） ---
               const userData = userDoc.data();
-              // オプショナルチェーン (?.) を使用して安全にアクセス
               const cid = userData?.companyId ?? null;
               
               setCompanyId(cid);
               setRole(userData?.role ?? null);
               setIsNewUser(false);
               
-              // 会社情報の取得
               if (cid) {
                 try {
                   const compDoc = await getDoc(doc(db, "companies", cid));
                   if (compDoc.exists()) {
                      const compData = compDoc.data();
-                     // ここも安全にアクセス
                      setInviteCode(compData?.inviteCode || "");
                      setUserCompanyName(compData?.name || ""); 
                   }
@@ -65,15 +73,27 @@ export const useAuth = () => {
                   console.error("会社情報取得エラー:", e);
                 }
               } else {
-                // 会社から削除された場合
                 setInviteCode("");
                 setUserCompanyName("");
               }
             } else {
-              // Firestoreにデータがない（ユーザー削除など）
-              setIsNewUser(true);
-              setCompanyId(null);
-              setRole(null);
+              // --- Firestoreにデータがない場合 ---
+              // 【修正ポイント】削除されたユーザーか、新規作成中かを確認する
+              try {
+                // Authサーバーに問い合わせてアカウントの生存確認を行う
+                await currentUser.reload();
+                
+                // エラーが出なければアカウントは有効（＝新規登録中のユーザー）
+                setIsNewUser(true);
+                setCompanyId(null);
+                setRole(null);
+              } catch (error) {
+                // エラーが出た場合（auth/user-not-foundなど）は削除済みとみなす
+                console.warn("ユーザーが無効なためログアウトします", error);
+                await signOut(auth);
+                resetState();
+                return;
+              }
             }
             setLoading(false);
           }, (error) => {
@@ -94,20 +114,9 @@ export const useAuth = () => {
         unsubscribeFirestore();
       }
     };
-  }, []);
+  }, []); // resetStateは内部state更新のみなので依存配列から除外しても実用上問題なし
 
-  // 状態リセット
-  const resetState = () => {
-    setUser(null);
-    setCompanyId(null);
-    setRole(null);
-    setUserCompanyName("");
-    setInviteCode("");
-    setIsWaitingVerification(false);
-    setIsNewUser(false);
-  };
-
-  // ログアウト処理
+  // ログアウト処理（外部呼び出し用）
   const logout = async () => {
     if (timeoutIdRef.current) {
       window.clearTimeout(timeoutIdRef.current);
@@ -116,12 +125,11 @@ export const useAuth = () => {
     resetState();
   };
 
-  // 無操作タイムアウト（10分）のロジック
+  // 無操作タイムアウト（10分）
   useEffect(() => {
     if (!user) return;
     
-    const timeoutDuration = 600000; // 10分
-
+    const timeoutDuration = 600000; 
     const handleTimeout = () => {
       alert("一定時間操作がなかったため、自動的にログアウトしました。");
       logout();
@@ -137,7 +145,7 @@ export const useAuth = () => {
     const events = ['mousemove', 'mousedown', 'keypress', 'scroll', 'touchstart', 'click'];
     events.forEach(event => window.addEventListener(event, resetTimer));
     
-    resetTimer(); // 初期セット
+    resetTimer();
 
     return () => {
       if (timeoutIdRef.current) {
