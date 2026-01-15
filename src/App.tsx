@@ -9,21 +9,21 @@ function App() {
     user, role, companyId, userCompanyName, inviteCode, 
     loading, isWaitingVerification, isNewUser, 
     logout 
-  } = useAuth();
+  } = useAuth(); //
   
   // 2. 会社データ（ログ・メンバー）の取得 (Hooks)
-  const { logs, members } = useCompanyData(companyId, role, user?.uid || "");
+  const { logs, members } = useCompanyData(companyId, role, user?.uid || ""); //
   
   // 3. 表示に関する状態
-  const [showSettings, setShowSettings] = useState(false);
+  const [showSettings, setShowSettings] = useState(false); //
 
   // 4. まとめてViewに渡す
   return (
     <AppView
       loading={loading}
       user={user}
-      role={role}
-      companyId={companyId}
+      role={role || ""} 
+      companyId={companyId || ""}
       userCompanyName={userCompanyName}
       inviteCode={inviteCode}
       isWaitingVerification={isWaitingVerification}

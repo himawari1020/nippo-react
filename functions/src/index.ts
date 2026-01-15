@@ -97,13 +97,24 @@ export const removeMember = onCall(async (request) => {
       throw new HttpsError("permission-denied", "管理者権限がありません。");
     }
 
-    // 2. Firestoreのユーザードキュメントを削除
+    // --- 修正箇所: Authenticationを先に削除する ---
+
+    // 2. Firebase Auth からユーザーアカウントを削除
+    // これにより該当ユーザーはログイン不能になります
+    try {
+      await admin.auth().deleteUser(targetUid);
+    } catch (authError: any) {
+      // 既に削除済み(user-not-found)の場合は無視して次に進む
+      // これにより「Authは消えているがDBに残っている」場合も正常にDB削除へ進めます
+      if (authError.code !== 'auth/user-not-found') {
+        console.error("Auth削除エラー:", authError);
+        throw authError; // 権限エラーなどは投げる
+      }
+    }
+
+    // 3. Firestoreのユーザードキュメントを削除
     // これにより users コレクションから該当ユーザーが消えます
     await db.collection("users").doc(targetUid).delete();
-
-    // 3. Firebase Auth からユーザーアカウントを削除
-    // これにより該当ユーザーはログイン不能になります
-    await admin.auth().deleteUser(targetUid);
 
     return { success: true };
   } catch (error: any) {
