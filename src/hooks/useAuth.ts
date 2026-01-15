@@ -18,9 +18,7 @@ export const useAuth = () => {
   // 自動ログアウト用タイマー
   const timeoutIdRef = useRef<number | null>(null);
 
-  // 状態リセット関数（useEffect内で使うため先に定義するか、useEffect内にロジックを書く）
-  // ここではset関数のみ使用するためuseEffectから参照しても安全ですが、
-  // 依存関係をシンプルにするため、ログアウト処理を共通化します。
+  // 状態リセット
   const resetState = () => {
     setUser(null);
     setCompanyId(null);
@@ -78,17 +76,17 @@ export const useAuth = () => {
               }
             } else {
               // --- Firestoreにデータがない場合 ---
-              // 【修正ポイント】削除されたユーザーか、新規作成中かを確認する
               try {
-                // Authサーバーに問い合わせてアカウントの生存確認を行う
-                await currentUser.reload();
+                // 【修正点】reload() ではなく getIdToken(true) を使用
+                // 強制的にトークンリフレッシュを行うことで、削除済みユーザー（リフレッシュトークン無効）を確実に検知してエラーを発生させます。
+                await currentUser.getIdToken(true);
                 
-                // エラーが出なければアカウントは有効（＝新規登録中のユーザー）
+                // エラーが出なければアカウントは有効（＝本当の新規登録中のユーザー）
                 setIsNewUser(true);
                 setCompanyId(null);
                 setRole(null);
               } catch (error) {
-                // エラーが出た場合（auth/user-not-foundなど）は削除済みとみなす
+                // トークンリフレッシュ失敗 ＝ 削除済みユーザー
                 console.warn("ユーザーが無効なためログアウトします", error);
                 await signOut(auth);
                 resetState();
@@ -114,9 +112,9 @@ export const useAuth = () => {
         unsubscribeFirestore();
       }
     };
-  }, []); // resetStateは内部state更新のみなので依存配列から除外しても実用上問題なし
+  }, []);
 
-  // ログアウト処理（外部呼び出し用）
+  // ログアウト処理
   const logout = async () => {
     if (timeoutIdRef.current) {
       window.clearTimeout(timeoutIdRef.current);
