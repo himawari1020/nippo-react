@@ -1,0 +1,475 @@
+import { useEffect, useState, useRef } from 'react';
+import { initializeApp } from "firebase/app";
+import { 
+  getFirestore, collection, query, where, orderBy, onSnapshot, 
+  doc, getDoc, setDoc, addDoc, updateDoc, limit 
+} from "firebase/firestore";
+import { 
+  getAuth, signInWithPopup, GoogleAuthProvider, onAuthStateChanged, signOut,
+  signInWithEmailAndPassword, createUserWithEmailAndPassword,
+  sendEmailVerification, setPersistence, browserSessionPersistence
+} from "firebase/auth";
+import { getFunctions, httpsCallable } from "firebase/functions";
+
+// Firebase設定
+const firebaseConfig = {
+  apiKey: "AIzaSyC2KghkOg6_5tzJFTg1mJQJNwVdzTcDAlw",
+  authDomain: "test-5070e.firebaseapp.com",
+  projectId: "test-5070e",
+  storageBucket: "test-5070e.firebasestorage.app",
+  messagingSenderId: "72288461152",
+  appId: "1:72288461152:web:8d6d0ce339ed412ed13e05",
+  measurementId: "G-MFN12452GM"
+};
+
+const app = initializeApp(firebaseConfig);
+const db = getFirestore(app);
+const auth = getAuth(app);
+
+// セッションの永続性を「ブラウザセッション（閉じるまで）」に設定
+setPersistence(auth, browserSessionPersistence)
+  .then(() => {
+    console.log("Persistence set to SESSION");
+  })
+  .catch((error) => {
+    console.error("Persistence setting error:", error);
+  });
+
+const functions = getFunctions(app);
+
+function App() {
+  const [user, setUser] = useState<any>(null);
+  const [role, setRole] = useState<string | null>(null);
+  const [companyId, setCompanyId] = useState<string | null>(null);
+  const [userCompanyName, setUserCompanyName] = useState<string>(""); 
+  const [inviteCode, setInviteCode] = useState<string>("");
+  const [isNewUser, setIsNewUser] = useState<boolean>(false);
+  const [newCompanyName, setNewCompanyName] = useState("");
+  const [logs, setLogs] = useState<any[]>([]);
+  const [members, setMembers] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [showSettings, setShowSettings] = useState(false);
+
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [isEmailSignUp, setIsEmailSignUp] = useState(false);
+  const [authError, setAuthError] = useState("");
+  const [isWaitingVerification, setIsWaitingVerification] = useState(false);
+
+  // 【修正】React(ブラウザ)環境用に型を number に変更
+  const timeoutIdRef = useRef<number | null>(null);
+
+  // 認証状態の監視
+  useEffect(() => {
+    return onAuthStateChanged(auth, async (currentUser) => {
+      if (currentUser) {
+        if (!currentUser.emailVerified && currentUser.providerData[0]?.providerId === 'password') {
+          setIsWaitingVerification(true);
+          setUser(currentUser);
+        } else {
+          setIsWaitingVerification(false);
+          setUser(currentUser);
+          await fetchUserCompanyInfo(currentUser);
+        }
+      } else {
+        setUser(null);
+        setCompanyId(null);
+        setRole(null);
+        setIsWaitingVerification(false);
+        setShowSettings(false);
+      }
+      setLoading(false);
+    });
+  }, []);
+
+  const fetchUserCompanyInfo = async (currentUser: any) => {
+    try {
+      const userDoc = await getDoc(doc(db, "users", currentUser.uid));
+      if (userDoc.exists()) {
+        const userData = userDoc.data();
+        const cid = userData.companyId;
+        setCompanyId(cid);
+        setRole(userData.role);
+        setIsNewUser(false);
+        
+        // 会社情報の取得
+        const compDoc = await getDoc(doc(db, "companies", cid));
+        if (compDoc.exists()) {
+           const compData = compDoc.data();
+           setInviteCode(compData.inviteCode);
+           setUserCompanyName(compData.name); 
+        }
+      } else {
+        setIsNewUser(true);
+      }
+    } catch (e) { console.error("データ取得エラー:", e); }
+  };
+
+  // ログとメンバーのリアルタイム購読
+  useEffect(() => {
+    if (!companyId || !user || role === null) return;
+
+    let qLogs;
+    if (role === 'admin') {
+      qLogs = query(
+        collection(db, "attendance"), 
+        where("companyId", "==", companyId), 
+        orderBy("timestamp", "desc"),
+        limit(50)
+      );
+    } else {
+      qLogs = query(
+        collection(db, "attendance"), 
+        where("companyId", "==", companyId), 
+        where("uid", "==", user.uid), 
+        orderBy("timestamp", "desc"),
+        limit(50)
+      );
+    }
+
+    const unsubLogs = onSnapshot(qLogs, (snapshot) => {
+      setLogs(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+    }, (err) => { console.error("ログ取得エラー:", err); });
+
+    let unsubMembers = () => {};
+    if (role === 'admin') {
+      const qMembers = query(collection(db, "users"), where("companyId", "==", companyId));
+      unsubMembers = onSnapshot(qMembers, (snapshot) => {
+        setMembers(snapshot.docs.map(doc => ({ uid: doc.id, ...doc.data() })));
+      });
+    }
+
+    return () => { unsubLogs(); unsubMembers(); };
+  }, [companyId, user, role]);
+
+  // ログイン・ログアウト関数定義
+  const loginWithGoogle = () => signInWithPopup(auth, new GoogleAuthProvider());
+  
+  const logout = () => { 
+    // ログアウト時にタイマーをクリア
+    if (timeoutIdRef.current) {
+      clearTimeout(timeoutIdRef.current);
+    }
+    signOut(auth); 
+    setCompanyId(null); 
+    setRole(null); 
+    setIsWaitingVerification(false); 
+    setShowSettings(false); 
+  };
+
+  // 【追加機能】無操作タイムアウト（10分 = 600000ms）
+  useEffect(() => {
+    // ログインしていない場合はタイマーを作動させない
+    if (!user) return;
+
+    const timeoutDuration = 600000; // 10分
+
+    const handleTimeout = () => {
+      alert("一定時間操作がなかったため、自動的にログアウトしました。");
+      logout();
+    };
+
+    const resetTimer = () => {
+      if (timeoutIdRef.current) {
+        clearTimeout(timeoutIdRef.current);
+      }
+      // window.setTimeout は number を返すので型エラーになりません
+      timeoutIdRef.current = window.setTimeout(handleTimeout, timeoutDuration);
+    };
+
+    // 監視するイベント一覧
+    const events = ['mousemove', 'mousedown', 'keypress', 'scroll', 'touchstart', 'click'];
+
+    // イベントリスナー登録
+    events.forEach(event => {
+      window.addEventListener(event, resetTimer);
+    });
+
+    // 初回タイマーセット
+    resetTimer();
+
+    // クリーンアップ
+    return () => {
+      if (timeoutIdRef.current) {
+        clearTimeout(timeoutIdRef.current);
+      }
+      events.forEach(event => {
+        window.removeEventListener(event, resetTimer);
+      });
+    };
+  }, [user]); // userが変わるたびにリセット
+
+  // 解約（会社削除）: Cloud Functions呼び出し
+  const handleDeleteAccount = async () => {
+    if (!user || !companyId) return;
+
+    const otherMembersCount = members.length - 1;
+    if (otherMembersCount > 0) {
+      alert(`解約できません。他の社員がまだ ${otherMembersCount} 名登録されています。先に社員を退会させてください。`);
+      return;
+    }
+
+    if (!window.confirm("本当に解約（アカウント削除）しますか？\n全ての打刻データ、会社情報、アカウントが完全に削除されます。")) return;
+
+    setLoading(true);
+    try {
+      const deleteAccountFunc = httpsCallable(functions, "deleteAccountAndCompany");
+      await deleteAccountFunc();
+      alert("解約処理が完了しました。ご利用ありがとうございました。");
+      logout(); // 明示的にログアウト
+    } catch (err: any) {
+      console.error(err);
+      alert(`エラーが発生しました: ${err.message}`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleEmailAuth = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthError("");
+    try {
+      if (isEmailSignUp) {
+        const userCredential = await createUserWithEmailAndPassword(auth, email, password);
+        await sendEmailVerification(userCredential.user);
+        alert("認証メールを送信しました。");
+        setIsWaitingVerification(true);
+      } else {
+        await signInWithEmailAndPassword(auth, email, password);
+      }
+    } catch (err: any) { setAuthError("エラーが発生しました。"); }
+  };
+
+  const checkVerificationStatus = async () => {
+    if (auth.currentUser) {
+      try {
+        await auth.currentUser.reload();
+        if (auth.currentUser.emailVerified) {
+          await auth.currentUser.getIdToken(true); 
+          setIsWaitingVerification(false);
+          setUser(auth.currentUser);
+          await fetchUserCompanyInfo(auth.currentUser);
+        } else { alert("まだメール認証が完了していません。"); }
+      } catch (error) { console.error(error); }
+    }
+  };
+
+  const handleRegister = async () => {
+    const currentUser = auth.currentUser;
+    if (!newCompanyName || !currentUser) return;
+    try {
+      const code = Math.random().toString(36).substring(2, 8).toUpperCase();
+      const compRef = await addDoc(collection(db, "companies"), { name: newCompanyName, inviteCode: code, adminUid: currentUser.uid });
+      await setDoc(doc(db, "users", currentUser.uid), { userName: currentUser.displayName || currentUser.email?.split('@')[0], role: "admin", companyId: compRef.id });
+      setCompanyId(compRef.id);
+      setRole("admin");
+      setInviteCode(code);
+      setUserCompanyName(newCompanyName); 
+      setIsNewUser(false);
+    } catch (e: any) { console.error(e); }
+  };
+
+  const handleReissueCode = async () => {
+    if (!companyId || !window.confirm("招待コードを再発行しますか？")) return;
+    const newCode = Math.random().toString(36).substring(2, 8).toUpperCase();
+    await updateDoc(doc(db, "companies", companyId), { inviteCode: newCode });
+    setInviteCode(newCode);
+  };
+
+  const handleRemoveMember = async (targetUid: string, targetName: string) => {
+    if (!window.confirm(`${targetName} さんを退会させますか？`)) return;
+    
+    setLoading(true);
+    try {
+      const removeMemberFunc = httpsCallable(functions, "removeMember");
+      await removeMemberFunc({ targetUid: targetUid });
+      alert(`${targetName} さんを退会させました。`);
+    } catch (e: any) {
+      console.error("退会処理エラー:", e);
+      alert("退会処理に失敗しました。管理者権限を確認してください。");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const downloadCSV = () => {
+    let csv = "\uFEFF名前,タイプ,時刻\n";
+    logs.forEach(l => csv += `${l.userName},${l.type === 'clock_in' ? '出勤' : '退勤'},${l.timestamp?.toDate().toLocaleString()}\n`);
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url; link.download = "attendance.csv"; link.click();
+  };
+
+  if (loading) return <div style={styles.center}>処理中...</div>;
+
+  return (
+    <div style={styles.container}>
+      {!user ? (
+        <div style={styles.card}>
+          <h2>{isEmailSignUp ? "新規管理者登録" : "管理者ログイン"}</h2>
+          <form onSubmit={handleEmailAuth} style={styles.form}>
+            <input type="email" placeholder="メールアドレス" value={email} onChange={(e) => setEmail(e.target.value)} style={styles.input} required />
+            <input type="password" placeholder="パスワード" value={password} onChange={(e) => setPassword(e.target.value)} style={styles.input} required />
+            {authError && <p style={styles.errorText}>{authError}</p>}
+            <button type="submit" style={styles.primaryBtn}>{isEmailSignUp ? "アカウント作成" : "ログイン"}</button>
+          </form>
+          <button onClick={() => {setIsEmailSignUp(!isEmailSignUp); setAuthError("");}} style={styles.textBtn}>
+            {isEmailSignUp ? "既にアカウントをお持ちの方" : "新しく会社を登録する"}
+          </button>
+          <div style={styles.divider}>または</div>
+          <button onClick={loginWithGoogle} style={styles.googleBtn}>Googleでログイン</button>
+        </div>
+      ) : isWaitingVerification ? (
+        <div style={styles.card}>
+          <h2 style={{color: '#e67e22'}}>メール認証が必要です</h2>
+          <button onClick={checkVerificationStatus} style={styles.primaryBtn}>認証を完了しました</button>
+          <button onClick={logout} style={styles.textBtn}>ログアウトして戻る</button>
+        </div>
+      ) : isNewUser ? (
+        <div style={styles.card}>
+          <h3>会社作成</h3>
+          <input placeholder="会社名" value={newCompanyName} onChange={(e) => setNewCompanyName(e.target.value)} style={styles.input} />
+          <button onClick={handleRegister} style={styles.primaryBtn}>会社作成</button>
+          <button onClick={logout} style={styles.textBtn}>キャンセル</button>
+        </div>
+      ) : (
+        <div style={styles.dashboard}>
+          <header style={styles.header}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '15px' }}>
+              <h1 style={styles.title}>
+                {userCompanyName ? `${userCompanyName} - ` : ""}
+                {role === 'admin' ? "管理ダッシュボード" : "勤務状況確認"}
+              </h1>
+              <button onClick={() => setShowSettings(!showSettings)} style={styles.iconBtn} title="設定">⚙️</button>
+            </div>
+            <button onClick={logout} style={styles.logoutBtn}>ログアウト</button>
+          </header>
+
+          {showSettings ? (
+            <div style={styles.settingsCard}>
+              <h3>アカウント設定</h3>
+              <p style={styles.subText}>解約すると、これまでの打刻データや会社情報がすべて削除されます。この操作は取り消せません。</p>
+              <div style={{ borderTop: '1px solid #eee', paddingTop: '20px', marginTop: '20px' }}>
+                <h4 style={{ color: '#fa3e3e' }}>危険な操作</h4>
+                <button onClick={handleDeleteAccount} style={styles.deleteAccountBtn}>サービスを解約してデータを全削除する</button>
+                <br />
+                <button onClick={() => setShowSettings(false)} style={styles.textBtn}>ダッシュボードに戻る</button>
+              </div>
+            </div>
+          ) : (
+            <div style={styles.sectionRow}>
+              {role === 'admin' && (
+                <div style={styles.tableHalf}>
+                  <div style={styles.actionRow}><h3>社員管理</h3></div>
+                  <div style={styles.inviteBox}>
+                    <span>社員用招待コード: <strong>{inviteCode}</strong></span>
+                    <button onClick={handleReissueCode} style={styles.reissueBtn}>再発行</button>
+                  </div>
+                  <div style={styles.tableCard}>
+                    <table style={styles.table}>
+                      <thead><tr style={styles.tableHeader}><th>名前</th><th>権限</th><th>操作</th></tr></thead>
+                      <tbody>
+                        {members.map(m => (
+                          <tr key={m.uid} style={styles.tr}>
+                            <td style={styles.td}>{m.userName}</td>
+                            <td style={styles.td}>{m.role === 'admin' ? '管理者' : '一般'}</td>
+                            <td style={styles.td}>
+                              {m.uid !== user.uid && <button onClick={() => handleRemoveMember(m.uid, m.userName)} style={styles.deleteBtn}>退会</button>}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+
+              <div style={role === 'admin' ? styles.tableHalf : {width: '100%'}}>
+                <div style={styles.actionRow}>
+                  <h3>{role === 'admin' ? "最新ログ" : "あなたの打刻履歴"}</h3> 
+                  {role === 'admin' && <button onClick={downloadCSV} style={styles.csvBtn}>CSV出力</button>}
+                </div>
+                <div style={styles.tableCard}>
+                  <table style={styles.table}>
+                    <thead><tr style={styles.tableHeader}><th>名前</th><th>タイプ</th><th>時刻</th></tr></thead>
+                    <tbody>
+                      {logs.slice(0, 20).map(l => (
+                        <tr key={l.id} style={styles.tr}>
+                          <td style={styles.td}>{l.userName}</td>
+                          <td style={styles.td}>{l.type === 'clock_in' ? '出勤' : '退勤'}</td>
+                          <td style={styles.td}>{l.timestamp?.toDate().toLocaleString()}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// 中央寄せスタイル
+const styles: any = {
+  container: { 
+    minHeight: '100vh', 
+    width: '100vw', 
+    backgroundColor: '#f4f7f6', 
+    color: '#333', 
+    fontFamily: 'sans-serif',
+    display: 'flex', 
+    flexDirection: 'column',
+    alignItems: 'center', 
+    justifyContent: 'flex-start',
+    boxSizing: 'border-box'
+  },
+  center: { textAlign: 'center', padding: '100px' },
+  card: { 
+    width: '100%',
+    maxWidth: '400px', 
+    margin: '60px auto', 
+    padding: '40px', 
+    backgroundColor: '#fff', 
+    borderRadius: '12px', 
+    textAlign: 'center', 
+    boxShadow: '0 4px 12px rgba(0,0,0,0.1)',
+    boxSizing: 'border-box'
+  },
+  form: { display: 'flex', flexDirection: 'column', gap: '15px' },
+  input: { padding: '12px', borderRadius: '6px', border: '1px solid #ddd', fontSize: '16px', width: '100%', boxSizing: 'border-box' },
+  primaryBtn: { width: '100%', padding: '12px', backgroundColor: '#1877f2', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold', fontSize: '16px', marginTop: '10px' },
+  textBtn: { marginTop: '15px', background: 'none', border: 'none', color: '#1877f2', cursor: 'pointer', textDecoration: 'underline' },
+  googleBtn: { width: '100%', padding: '12px', backgroundColor: '#fff', color: '#555', border: '1px solid #ddd', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' },
+  divider: { margin: '20px 0', color: '#aaa', fontSize: '14px' },
+  errorText: { color: 'red', fontSize: '12px', textAlign: 'left', margin: 0 },
+  subText: { color: '#666', fontSize: '14px', marginBottom: '20px', lineHeight: '1.5' },
+  dashboard: { 
+    width: '100%',
+    maxWidth: '1200px', 
+    padding: '30px',
+    boxSizing: 'border-box' 
+  },
+  header: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '30px' },
+  title: { color: '#1c1e21', margin: 0 },
+  inviteBox: { backgroundColor: '#e7f3ff', padding: '10px 15px', borderRadius: '8px', color: '#1877f2', marginBottom: '15px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' },
+  reissueBtn: { marginLeft: '10px', padding: '4px 8px', backgroundColor: '#fff', color: '#1877f2', border: '1px solid #1877f2', borderRadius: '4px', cursor: 'pointer' },
+  logoutBtn: { backgroundColor: '#fa3e3e', color: '#fff', border: 'none', padding: '10px 20px', borderRadius: '6px', cursor: 'pointer' },
+  iconBtn: { background: 'none', border: 'none', fontSize: '24px', cursor: 'pointer', padding: '5px' },
+  settingsCard: { backgroundColor: '#fff', padding: '30px', borderRadius: '12px', boxShadow: '0 2px 8px rgba(0,0,0,0.05)', maxWidth: '600px', margin: '0 auto' },
+  deleteAccountBtn: { backgroundColor: '#fa3e3e', color: '#fff', border: 'none', padding: '12px 20px', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold', marginTop: '10px' },
+  sectionRow: { display: 'flex', gap: '30px', flexWrap: 'wrap', justifyContent: 'center' },
+  tableHalf: { flex: '1', minWidth: '400px', maxWidth: '585px' },
+  actionRow: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' },
+  csvBtn: { backgroundColor: '#10B981', color: '#fff', border: 'none', padding: '8px 16px', borderRadius: '6px', cursor: 'pointer' },
+  tableCard: { backgroundColor: '#fff', borderRadius: '12px', boxShadow: '0 2px 8px rgba(0,0,0,0.05)', overflow: 'hidden' },
+  table: { width: '100%', borderCollapse: 'collapse' },
+  tableHeader: { backgroundColor: '#f8f9fa' },
+  td: { padding: '12px', borderBottom: '1px solid #eee' },
+  deleteBtn: { backgroundColor: '#fff', color: '#fa3e3e', border: '1px solid #fa3e3e', padding: '4px 8px', borderRadius: '4px', cursor: 'pointer' }
+};
+
+export default App;
