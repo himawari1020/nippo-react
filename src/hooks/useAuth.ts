@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
-import { onAuthStateChanged, signOut } from "firebase/auth";
-import { doc, getDoc, onSnapshot } from "firebase/firestore"; // onSnapshotを追加
+import { onAuthStateChanged, signOut, Unsubscribe } from "firebase/auth";
+import { doc, getDoc, onSnapshot } from "firebase/firestore";
 import { auth, db } from '../lib/firebase';
 
 export const useAuth = () => {
@@ -19,6 +19,7 @@ export const useAuth = () => {
   const timeoutIdRef = useRef<number | null>(null);
 
   useEffect(() => {
+    // Firestoreの監視解除関数を保持する変数
     let unsubscribeFirestore: (() => void) | null = null;
 
     // 認証状態の監視を開始
@@ -39,42 +40,41 @@ export const useAuth = () => {
           setIsWaitingVerification(false);
           setUser(currentUser);
           
-          // 【修正】getDocではなくonSnapshotでユーザー情報をリアルタイム監視
+          // ユーザー情報をリアルタイム監視
           unsubscribeFirestore = onSnapshot(doc(db, "users", currentUser.uid), async (userDoc) => {
             if (userDoc.exists()) {
               const userData = userDoc.data();
-              const cid = userData.companyId;
+              // 【修正】オプショナルチェーン (?.) を使用してエラーを回避
+              const cid = userData?.companyId;
               
               setCompanyId(cid);
-              setRole(userData.role);
+              setRole(userData?.role);
               setIsNewUser(false);
               
               // 会社情報の取得
-              // ※会社名は頻繁に変更されないためgetDocのままで良いが、必要に応じてここもonSnapshotにできます
               if (cid) {
                 try {
                   const compDoc = await getDoc(doc(db, "companies", cid));
                   if (compDoc.exists()) {
                      const compData = compDoc.data();
-                     setInviteCode(compData.inviteCode);
-                     setUserCompanyName(compData.name); 
+                     // ここも念のため ?. を付与
+                     setInviteCode(compData?.inviteCode || "");
+                     setUserCompanyName(compData?.name || ""); 
                   }
                 } catch (e) {
                   console.error("会社情報取得エラー:", e);
                 }
               } else {
-                // 会社から削除された場合（cidがnull/undefined）
+                // 会社から削除された場合
                 setInviteCode("");
                 setUserCompanyName("");
-                // ここで setCompanyId(null) されるため、App.tsx側で会社未所属の状態として描画が切り替わります
               }
             } else {
-              // Firestoreにデータがない（ユーザー削除など） = 新規扱いまたは強制ログアウト対象
+              // Firestoreにデータがない（ユーザー削除など）
               setIsNewUser(true);
               setCompanyId(null);
               setRole(null);
             }
-            // データ取得完了（初回および更新時）
             setLoading(false);
           }, (error) => {
             console.error("ユーザーデータ監視エラー:", error);
@@ -90,7 +90,9 @@ export const useAuth = () => {
 
     return () => {
       unsubscribeAuth();
-      if (unsubscribeFirestore) unsubscribeFirestore();
+      if (unsubscribeFirestore) {
+        unsubscribeFirestore();
+      }
     };
   }, []);
 
