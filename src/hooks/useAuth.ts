@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { onAuthStateChanged, signOut, Unsubscribe } from "firebase/auth";
+import { onAuthStateChanged, signOut } from "firebase/auth";
 import { doc, getDoc, onSnapshot } from "firebase/firestore";
 import { auth, db } from '../lib/firebase';
 
@@ -40,15 +40,15 @@ export const useAuth = () => {
           setIsWaitingVerification(false);
           setUser(currentUser);
           
-          // ユーザー情報をリアルタイム監視
+          // 【修正】getDocではなくonSnapshotでユーザー情報をリアルタイム監視
           unsubscribeFirestore = onSnapshot(doc(db, "users", currentUser.uid), async (userDoc) => {
             if (userDoc.exists()) {
               const userData = userDoc.data();
-              // 【修正】オプショナルチェーン (?.) を使用してエラーを回避
-              const cid = userData?.companyId;
+              // オプショナルチェーン (?.) を使用して安全にアクセス
+              const cid = userData?.companyId ?? null;
               
               setCompanyId(cid);
-              setRole(userData?.role);
+              setRole(userData?.role ?? null);
               setIsNewUser(false);
               
               // 会社情報の取得
@@ -57,7 +57,7 @@ export const useAuth = () => {
                   const compDoc = await getDoc(doc(db, "companies", cid));
                   if (compDoc.exists()) {
                      const compData = compDoc.data();
-                     // ここも念のため ?. を付与
+                     // ここも安全にアクセス
                      setInviteCode(compData?.inviteCode || "");
                      setUserCompanyName(compData?.name || ""); 
                   }
