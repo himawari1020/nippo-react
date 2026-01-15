@@ -1,6 +1,7 @@
 export const TEXT = {
   // 共通
   COMMON: {
+    APP_NAME: "nippo", // 追加
     LOADING: "処理中...",
     WAIT_SERVER: "サーバーと通信しています...",
     ERROR_PREFIX: "エラー: ",

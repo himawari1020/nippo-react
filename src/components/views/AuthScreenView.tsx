@@ -22,6 +22,11 @@ export const AuthScreenView = ({
   
   return (
     <div style={styles.card}>
+      {/* アプリ名を表示 */}
+      <h1 style={{ textAlign: 'center', color: '#333', marginBottom: '10px' }}>
+        {TEXT.COMMON.APP_NAME}
+      </h1>
+
       <h2>{isEmailSignUp ? TEXT.AUTH.SIGNUP_TITLE : TEXT.AUTH.LOGIN_TITLE}</h2>
       
       <form onSubmit={onSubmit} style={styles.form}>
