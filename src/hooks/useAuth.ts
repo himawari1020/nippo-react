@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { onAuthStateChanged, signOut } from "firebase/auth";
-import { doc, getDoc } from "firebase/firestore";
+import { doc, getDoc, onSnapshot } from "firebase/firestore"; // onSnapshotを追加
 import { auth, db } from '../lib/firebase';
 
 export const useAuth = () => {
@@ -19,8 +19,16 @@ export const useAuth = () => {
   const timeoutIdRef = useRef<number | null>(null);
 
   useEffect(() => {
+    let unsubscribeFirestore: (() => void) | null = null;
+
     // 認証状態の監視を開始
-    const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
+    const unsubscribeAuth = onAuthStateChanged(auth, async (currentUser) => {
+      // ユーザー切り替え時などに前のリスナーがあれば解除
+      if (unsubscribeFirestore) {
+        unsubscribeFirestore();
+        unsubscribeFirestore = null;
+      }
+
       if (currentUser) {
         // メール認証待ちのチェック
         if (!currentUser.emailVerified && currentUser.providerData[0]?.providerId === 'password') {
@@ -30,9 +38,48 @@ export const useAuth = () => {
         } else {
           setIsWaitingVerification(false);
           setUser(currentUser);
-          // ユーザーの追加情報（会社IDや権限）をFirestoreから取得
-          await fetchUserCompanyInfo(currentUser);
-          setLoading(false);
+          
+          // 【修正】getDocではなくonSnapshotでユーザー情報をリアルタイム監視
+          unsubscribeFirestore = onSnapshot(doc(db, "users", currentUser.uid), async (userDoc) => {
+            if (userDoc.exists()) {
+              const userData = userDoc.data();
+              const cid = userData.companyId;
+              
+              setCompanyId(cid);
+              setRole(userData.role);
+              setIsNewUser(false);
+              
+              // 会社情報の取得
+              // ※会社名は頻繁に変更されないためgetDocのままで良いが、必要に応じてここもonSnapshotにできます
+              if (cid) {
+                try {
+                  const compDoc = await getDoc(doc(db, "companies", cid));
+                  if (compDoc.exists()) {
+                     const compData = compDoc.data();
+                     setInviteCode(compData.inviteCode);
+                     setUserCompanyName(compData.name); 
+                  }
+                } catch (e) {
+                  console.error("会社情報取得エラー:", e);
+                }
+              } else {
+                // 会社から削除された場合（cidがnull/undefined）
+                setInviteCode("");
+                setUserCompanyName("");
+                // ここで setCompanyId(null) されるため、App.tsx側で会社未所属の状態として描画が切り替わります
+              }
+            } else {
+              // Firestoreにデータがない（ユーザー削除など） = 新規扱いまたは強制ログアウト対象
+              setIsNewUser(true);
+              setCompanyId(null);
+              setRole(null);
+            }
+            // データ取得完了（初回および更新時）
+            setLoading(false);
+          }, (error) => {
+            console.error("ユーザーデータ監視エラー:", error);
+            setLoading(false);
+          });
         }
       } else {
         // ログアウト時
@@ -41,7 +88,10 @@ export const useAuth = () => {
       }
     });
 
-    return () => unsubscribe();
+    return () => {
+      unsubscribeAuth();
+      if (unsubscribeFirestore) unsubscribeFirestore();
+    };
   }, []);
 
   // 状態リセット
@@ -53,37 +103,6 @@ export const useAuth = () => {
     setInviteCode("");
     setIsWaitingVerification(false);
     setIsNewUser(false);
-  };
-
-  // Firestoreからユーザーと会社の情報を取得
-  const fetchUserCompanyInfo = async (currentUser: any) => {
-    try {
-      const userDoc = await getDoc(doc(db, "users", currentUser.uid));
-      
-      if (userDoc.exists()) {
-        const userData = userDoc.data();
-        const cid = userData.companyId;
-        
-        setCompanyId(cid);
-        setRole(userData.role);
-        setIsNewUser(false);
-        
-        // 会社情報の取得（招待コードや会社名）
-        if (cid) {
-          const compDoc = await getDoc(doc(db, "companies", cid));
-          if (compDoc.exists()) {
-             const compData = compDoc.data();
-             setInviteCode(compData.inviteCode);
-             setUserCompanyName(compData.name); 
-          }
-        }
-      } else {
-        // Firestoreにデータがない = 完全な新規ユーザー
-        setIsNewUser(true);
-      }
-    } catch (e) {
-      console.error("ユーザーデータ取得エラー:", e);
-    }
   };
 
   // ログアウト処理
