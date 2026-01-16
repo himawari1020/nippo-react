@@ -44,6 +44,7 @@ export const deleteAccountAndCompany = onCall(async (request) => {
     const batch = db.batch();
 
     // A. 該当する全ての打刻ログを削除
+    // 注意: 打刻ログが500件を超えるとバッチ制限によりエラーになる可能性があります（将来的に修正推奨）
     const attendanceSnapshot = await db.collection("attendance")
       .where("companyId", "==", companyId)
       .get();
@@ -97,23 +98,18 @@ export const removeMember = onCall(async (request) => {
       throw new HttpsError("permission-denied", "管理者権限がありません。");
     }
 
-    // --- 修正箇所: Authenticationを先に削除する ---
-
     // 2. Firebase Auth からユーザーアカウントを削除
-    // これにより該当ユーザーはログイン不能になります
     try {
       await admin.auth().deleteUser(targetUid);
     } catch (authError: any) {
       // 既に削除済み(user-not-found)の場合は無視して次に進む
-      // これにより「Authは消えているがDBに残っている」場合も正常にDB削除へ進めます
       if (authError.code !== 'auth/user-not-found') {
         console.error("Auth削除エラー:", authError);
-        throw authError; // 権限エラーなどは投げる
+        throw authError; 
       }
     }
 
     // 3. Firestoreのユーザードキュメントを削除
-    // これにより users コレクションから該当ユーザーが消えます
     await db.collection("users").doc(targetUid).delete();
 
     return { success: true };
@@ -126,7 +122,6 @@ export const removeMember = onCall(async (request) => {
 
 /**
  * 3. 会社参加処理（招待コードを使って会社に所属する）
- * クライアントから直接DBを検索させないための安全な関数です。
  */
 export const joinCompany = onCall(async (request) => {
   // 認証チェック
@@ -145,7 +140,6 @@ export const joinCompany = onCall(async (request) => {
 
   try {
     // A. 招待コードから会社を検索
-    // アプリ側で大文字変換していますが、念のためここでもtoUpperCase()します
     const companiesSnapshot = await db.collection("companies")
       .where("inviteCode", "==", inviteCode.toUpperCase())
       .limit(1)
@@ -158,8 +152,7 @@ export const joinCompany = onCall(async (request) => {
     const companyDoc = companiesSnapshot.docs[0];
     const companyId = companyDoc.id;
 
-    // B. ユーザー情報を安全に更新（既存データを消さずにマージ）
-    // set(..., { merge: true }) を使うことで、プロフィール画像などが将来増えても消えません
+    // B. ユーザー情報を安全に更新
     await db.collection("users").doc(uid).set({
       userName: userName,
       companyId: companyId,
@@ -180,8 +173,9 @@ export const joinCompany = onCall(async (request) => {
 });
 
 /**
- * 4. 打刻処理 (NEW)
+ * 4. 打刻処理 (修正版)
  * クライアントからの直接書き込みを防ぎ、サーバー時間で正確に記録します。
+ * 直近の打刻状態を確認し、矛盾する操作（連続出勤など）をブロックします。
  */
 export const recordAttendance = onCall(async (request) => {
   // 認証チェック
@@ -208,13 +202,44 @@ export const recordAttendance = onCall(async (request) => {
       throw new HttpsError("not-found", "ユーザー情報が見つかりません。");
     }
     
-    // 正しいユーザー名を取得 (フォールバックとして Authトークンの名前を使用)
+    // 正しいユーザー名を取得
     const userName = userDoc.data()?.userName || request.auth.token.name || "Unknown";
+
+    // --- 修正: 直近の打刻履歴を取得してチェック ---
+    const lastLogSnapshot = await db.collection("attendance")
+      .where("companyId", "==", companyId)
+      .where("uid", "==", uid)
+      .orderBy("timestamp", "desc") // 最新順
+      .limit(1)
+      .get();
+
+    let lastType = null;
+    if (!lastLogSnapshot.empty) {
+      lastType = lastLogSnapshot.docs[0].data().type;
+    }
+
+    // チェックロジック
+    if (type === 'clock_in') {
+      // 出勤しようとしているのに、最後が「出勤」ならエラー
+      if (lastType === 'clock_in') {
+        throw new HttpsError("failed-precondition", "既に出勤しています（二重出勤はできません）。");
+      }
+    } else if (type === 'clock_out') {
+      // 退勤しようとしているのに、履歴がない場合はエラー
+      if (lastType === null) {
+        throw new HttpsError("failed-precondition", "出勤記録が見つかりません。");
+      }
+      // 退勤しようとしているのに、最後が「退勤」ならエラー
+      if (lastType === 'clock_out') {
+        throw new HttpsError("failed-precondition", "既に退勤しています（二重退勤はできません）。");
+      }
+    }
+    // ---------------------------------------------
 
     // 打刻データの保存
     await db.collection("attendance").add({
       uid: uid,
-      userName: userName, // 安全なソースから取得した名前
+      userName: userName,
       type: type,
       companyId: companyId,
       timestamp: admin.firestore.FieldValue.serverTimestamp(), // サーバー時間
@@ -234,7 +259,7 @@ export const recordAttendance = onCall(async (request) => {
 });
 
 /**
- * 5. 会社作成処理 (NEW)
+ * 5. 会社作成処理
  * ユーザーが新しい会社を作成し、その管理者になります。
  */
 export const createCompany = onCall(async (request) => {
@@ -253,10 +278,11 @@ export const createCompany = onCall(async (request) => {
   }
 
   // 招待コードの生成（ランダムな6文字・大文字）
+  // 注意: 重複チェックが行われていません（将来的に修正推奨）
   const inviteCode = Math.random().toString(36).substring(2, 8).toUpperCase();
 
   try {
-    // トランザクションで一括処理（整合性を保つため）
+    // トランザクションで一括処理
     await db.runTransaction(async (transaction) => {
       // 1. ユーザーが既に会社に所属していないか確認
       const userRef = db.collection("users").doc(uid);
@@ -300,7 +326,7 @@ export const createCompany = onCall(async (request) => {
 });
 
 /**
- * 6. 招待コード再発行 (NEW)
+ * 6. 招待コード再発行
  * 管理者が自社の招待コードを新しく生成します。
  */
 export const reissueInviteCode = onCall(async (request) => {
@@ -317,14 +343,14 @@ export const reissueInviteCode = onCall(async (request) => {
     const userDoc = await db.collection("users").doc(uid).get();
     const userData = userDoc.data();
     
-    // データがない、権限がない、または会社IDがない場合はエラー
     if (!userDoc.exists || userData?.role !== "admin" || !userData?.companyId) {
       throw new HttpsError("permission-denied", "管理者権限がありません。");
     }
 
     const companyId = userData.companyId;
 
-    // 2. 新しいコードを生成（ランダムな6文字・大文字）
+    // 2. 新しいコードを生成
+    // 注意: 重複チェックが行われていません（将来的に修正推奨）
     const newInviteCode = Math.random().toString(36).substring(2, 8).toUpperCase();
 
     // 3. 会社情報を更新
