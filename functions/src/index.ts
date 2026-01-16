@@ -3,26 +3,11 @@ import * as admin from "firebase-admin";
 
 admin.initializeApp();
 
-/**
- * 【共通バリデーション】
- * 1. ログイン状態の確認
- * 2. メール認証が完了しているかの確認（パスワード認証の場合のみ）
- */
-const validateAuth = (auth: any) => {
-  if (!auth) {
-    throw new HttpsError("unauthenticated", "ログインが必要です。");
-  }
-  // パスワード認証（email/password）を利用しており、かつメール未認証の場合はエラーを返却
-  if (auth.token.firebase.sign_in_provider === 'password' && !auth.token.email_verified) {
-    throw new HttpsError("permission-denied", "メール認証を完了してください。");
-  }
-};
-
 // --- ヘルパー関数: 重複しない招待コードを生成 ---
 async function generateUniqueInviteCode(db: admin.firestore.Firestore): Promise<string> {
   let inviteCode = "";
   let isUnique = false;
-  const maxRetries = 10; // 無限ループ防止
+  const maxRetries = 10; // 無限ループ防止のためのリミット
 
   for (let i = 0; i < maxRetries; i++) {
     // ランダムな6文字・大文字
@@ -48,14 +33,16 @@ async function generateUniqueInviteCode(db: admin.firestore.Firestore): Promise<
 }
 
 /**
- * 1. サービス解約処理
- * 会社に関連する全データ（打刻ログ含む）を分割削除し、安全に解約します。
+ * 1. サービス解約処理（修正版）
+ * 打刻ログが大量にある場合でも、分割して削除することで500件制限のエラーを回避します。
  */
 export const deleteAccountAndCompany = onCall(async (request) => {
-  // 認証とメール確認のチェック
-  validateAuth(request.auth);
+  // 認証チェック
+  if (!request.auth) {
+    throw new HttpsError("unauthenticated", "ログインが必要です。");
+  }
 
-  const uid = request.auth!.uid;
+  const uid = request.auth.uid;
   const db = admin.firestore();
 
   try {
@@ -131,10 +118,11 @@ export const deleteAccountAndCompany = onCall(async (request) => {
  * 指定したユーザーのドキュメントと認証アカウントを完全に削除します。
  */
 export const removeMember = onCall(async (request) => {
-  // 認証とメール確認のチェック
-  validateAuth(request.auth);
+  if (!request.auth) {
+    throw new HttpsError("unauthenticated", "ログインが必要です。");
+  }
 
-  const adminUid = request.auth!.uid;
+  const adminUid = request.auth.uid;
   const targetUid = request.data.targetUid;
 
   if (!targetUid) {
@@ -173,11 +161,12 @@ export const removeMember = onCall(async (request) => {
  * 招待コードを使って会社に所属します。
  */
 export const joinCompany = onCall(async (request) => {
-  // 認証とメール確認のチェック
-  validateAuth(request.auth);
+  if (!request.auth) {
+    throw new HttpsError("unauthenticated", "ログインが必要です。");
+  }
 
   const { inviteCode, userName } = request.data;
-  const uid = request.auth!.uid;
+  const uid = request.auth.uid;
   const db = admin.firestore();
 
   if (!inviteCode || !userName) {
@@ -217,15 +206,16 @@ export const joinCompany = onCall(async (request) => {
 });
 
 /**
- * 4. 打刻処理
+ * 4. 打刻処理 (修正版)
  * 直近の打刻状態を確認し、矛盾する操作（連続出勤など）をブロックします。
  */
 export const recordAttendance = onCall(async (request) => {
-  // 認証とメール確認のチェック
-  validateAuth(request.auth);
+  if (!request.auth) {
+    throw new HttpsError("unauthenticated", "ログインが必要です。");
+  }
 
   const { type, companyId } = request.data;
-  const uid = request.auth!.uid;
+  const uid = request.auth.uid;
   const db = admin.firestore();
 
   if (!['clock_in', 'clock_out'].includes(type)) {
@@ -241,7 +231,7 @@ export const recordAttendance = onCall(async (request) => {
       throw new HttpsError("not-found", "ユーザー情報が見つかりません。");
     }
     
-    const userName = userDoc.data()?.userName || request.auth!.token.name || "Unknown";
+    const userName = userDoc.data()?.userName || request.auth.token.name || "Unknown";
 
     const lastLogSnapshot = await db.collection("attendance")
       .where("companyId", "==", companyId)
@@ -290,15 +280,16 @@ export const recordAttendance = onCall(async (request) => {
 });
 
 /**
- * 5. 会社作成処理
- * 招待コードの重複チェック付き
+ * 5. 会社作成処理 (修正版)
+ * 招待コードの重複チェックを追加しました。
  */
 export const createCompany = onCall(async (request) => {
-  // 認証とメール確認のチェック
-  validateAuth(request.auth);
+  if (!request.auth) {
+    throw new HttpsError("unauthenticated", "ログインが必要です。");
+  }
 
   const { companyName, userName } = request.data;
-  const uid = request.auth!.uid;
+  const uid = request.auth.uid;
   const db = admin.firestore();
 
   if (!companyName || !userName) {
@@ -306,7 +297,7 @@ export const createCompany = onCall(async (request) => {
   }
 
   try {
-    // 重複しない招待コードを生成
+    // --- 修正: 重複しない招待コードを生成 ---
     const inviteCode = await generateUniqueInviteCode(db);
 
     await db.runTransaction(async (transaction) => {
@@ -352,14 +343,15 @@ export const createCompany = onCall(async (request) => {
 });
 
 /**
- * 6. 招待コード再発行
- * 招待コードの重複チェック付き
+ * 6. 招待コード再発行 (修正版)
+ * 招待コードの重複チェックを追加しました。
  */
 export const reissueInviteCode = onCall(async (request) => {
-  // 認証とメール確認のチェック
-  validateAuth(request.auth);
+  if (!request.auth) {
+    throw new HttpsError("unauthenticated", "ログインが必要です。");
+  }
 
-  const uid = request.auth!.uid;
+  const uid = request.auth.uid;
   const db = admin.firestore();
 
   try {
@@ -372,7 +364,7 @@ export const reissueInviteCode = onCall(async (request) => {
 
     const companyId = userData.companyId;
 
-    // 重複しない新しいコードを生成
+    // --- 修正: 重複しない新しいコードを生成 ---
     const newInviteCode = await generateUniqueInviteCode(db);
 
     await db.collection("companies").doc(companyId).update({
