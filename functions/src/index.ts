@@ -4,8 +4,8 @@ import * as admin from "firebase-admin";
 admin.initializeApp();
 
 /**
- * 1. サービス解約処理（管理者アカウント・会社データ・全打刻ログの削除）
- * 管理者が自分自身と会社全体を削除する場合に使用します。
+ * 1. サービス解約処理（修正版）
+ * 打刻ログが大量にある場合でも、分割して削除することで500件制限のエラーを回避します。
  */
 export const deleteAccountAndCompany = onCall(async (request) => {
   // 認証チェック
@@ -40,17 +40,30 @@ export const deleteAccountAndCompany = onCall(async (request) => {
       throw new HttpsError("failed-precondition", "他の社員が残っているため解約できません。");
     }
 
-    // --- 削除処理の実行 (バッチ処理) ---
-    const batch = db.batch();
-
-    // A. 該当する全ての打刻ログを削除
-    // 注意: 打刻ログが500件を超えるとバッチ制限によりエラーになる可能性があります（将来的に修正推奨）
+    // --- 削除処理の実行 (バッチ分割処理) ---
+    
+    // A. 該当する全ての打刻ログを取得
     const attendanceSnapshot = await db.collection("attendance")
       .where("companyId", "==", companyId)
       .get();
-    attendanceSnapshot.forEach((doc) => {
+
+    // バッチ処理の準備
+    // Firestoreのバッチは1回につき最大500件まで
+    const MAX_BATCH_SIZE = 400; // 安全マージンをとって400件で区切る
+    let batch = db.batch();
+    let operationCount = 0;
+
+    for (const doc of attendanceSnapshot.docs) {
       batch.delete(doc.ref);
-    });
+      operationCount++;
+
+      // 規定数に達したら一度コミットして、新しいバッチを作成
+      if (operationCount >= MAX_BATCH_SIZE) {
+        await batch.commit();
+        batch = db.batch();
+        operationCount = 0;
+      }
+    }
 
     // B. 会社ドキュメントを削除
     batch.delete(db.collection("companies").doc(companyId));
@@ -58,7 +71,7 @@ export const deleteAccountAndCompany = onCall(async (request) => {
     // C. 管理者自身のユーザードキュメントを削除
     batch.delete(db.collection("users").doc(uid));
 
-    // Firestoreの変更を確定
+    // 残りの削除操作をコミット（ログの端数 + 会社 + ユーザー）
     await batch.commit();
 
     // D. Firebase Auth から管理者アカウントを削除
@@ -73,8 +86,8 @@ export const deleteAccountAndCompany = onCall(async (request) => {
 });
 
 /**
- * 2. 社員削除処理（指定したユーザーのドキュメントと認証アカウントを完全に削除）
- * 管理者が特定の社員を削除（解雇・退職処理）する場合に使用します。
+ * 2. 社員削除処理
+ * 指定したユーザーのドキュメントと認証アカウントを完全に削除します。
  */
 export const removeMember = onCall(async (request) => {
   // 認証チェック
@@ -121,7 +134,8 @@ export const removeMember = onCall(async (request) => {
 });
 
 /**
- * 3. 会社参加処理（招待コードを使って会社に所属する）
+ * 3. 会社参加処理
+ * 招待コードを使って会社に所属します。
  */
 export const joinCompany = onCall(async (request) => {
   // 認証チェック
@@ -205,7 +219,7 @@ export const recordAttendance = onCall(async (request) => {
     // 正しいユーザー名を取得
     const userName = userDoc.data()?.userName || request.auth.token.name || "Unknown";
 
-    // --- 修正: 直近の打刻履歴を取得してチェック ---
+    // --- 直近の打刻履歴を取得してチェック ---
     const lastLogSnapshot = await db.collection("attendance")
       .where("companyId", "==", companyId)
       .where("uid", "==", uid)
